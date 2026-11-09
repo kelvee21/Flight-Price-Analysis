@@ -1,0 +1,34 @@
+# Airflow
+logs/
+*.log
+airflow.cfg
+webserver_config.py
+config/
+plugins/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+flight-price-venv/
+
+# Environment
+.env
+
+# Data
+include/data/*.csv
+!include/data/Flight_Price_Dataset_of_Bangladesh.csv
+include/data/processed/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Local documentation (tracked only when intentionally added)
+docs/
