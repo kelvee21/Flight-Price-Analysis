@@ -1,8 +1,31 @@
 # Flight Price Analysis - Airflow Data Pipeline
 
 An Apache Airflow pipeline that loads the Bangladesh flight price CSV into a
-**MySQL** staging table, validates and transforms it with **PySpark**, and loads
-a **PostgreSQL** star schema with SQL views for the KPIs.
+**MariaDB** (MySQL-compatible) staging table, validates and transforms it on a
+**Spark** cluster, and loads a **PostgreSQL** star schema with SQL views for the
+KPIs.
+
+## Architecture
+
+Docker Compose runs each part in its own container, like separate cloud services:
+
+| Container | Role | Cloud equivalent |
+| --- | --- | --- |
+| `airflow-*` | Orchestration: runs the DAG, Pandas I/O, Spark driver | MWAA / Cloud Composer |
+| `spark-master`, `spark-worker` | Compute: executors clean and transform the data | EMR / Dataproc |
+| `mariadb` | Staging database `flight_staging` | RDS / Cloud SQL |
+| `postgres` | Airflow metadata + `analytics` star schema | RDS PostgreSQL / Redshift |
+| `include/data` (shared folder) | Parquet files passed between tasks | S3 / GCS |
+
+```text
+CSV --> mariadb (staging) --> Spark cluster (validate, clean, star schema)
+                                   |  Parquet in include/data/processed/<run_id>/
+                                   v
+                         postgres "analytics" schema --> KPI views
+```
+
+In the WSL setup there is no cluster: Spark runs in local mode inside the
+Airflow process. `SPARK_MASTER` decides which one is used.
 
 The full write-up is in [`reports/final-report.md`](reports/final-report.md)
 (also as [`final-report.docx`](reports/final-report.docx)).
@@ -15,9 +38,9 @@ ensure_staging_table -> ingest_csv -> validate_data -> transform_to_star_schema 
 
 | Task | What it does |
 | --- | --- |
-| `ensure_staging_table` | Creates `flight_staging.stg_flight_prices` in MySQL |
+| `ensure_staging_table` | Creates `flight_staging.stg_flight_prices` in MariaDB |
 | `ingest_csv` | Pandas loads the CSV into staging (full refresh, row count checked) |
-| `validate_data` | Reads staging from MySQL and counts data-quality problems with Spark |
+| `validate_data` | Reads staging from MariaDB and counts data-quality problems with Spark |
 | `transform_to_star_schema` | Spark cleans rows, quarantines rejects, builds dimensions and the fact |
 | `load_to_postgres` | Loads the `analytics` schema in one transaction and writes a run-log row |
 
@@ -29,13 +52,14 @@ ensure_staging_table -> ingest_csv -> validate_data -> transform_to_star_schema 
 ├── include/
 │   ├── config.py                     # settings, column mapping, peak seasons
 │   ├── scripts/spark_transform.py    # Spark validation and star-schema build
-│   ├── sql/                          # MySQL staging + PostgreSQL warehouse DDL and KPI views
+│   ├── sql/                          # MariaDB staging + PostgreSQL warehouse DDL and KPI views
 │   └── data/                         # source CSV (Spark output goes to data/processed/, ignored)
 ├── tests/                            # pytest: Spark logic and DAG structure
 ├── scripts/                          # WSL setup and run helpers
 ├── reports/                          # final project report (.md and .docx)
 ├── Dockerfile                        # Airflow + Java 21 + PySpark image
-└── docker-compose.yaml               # Airflow + MySQL + PostgreSQL
+├── Dockerfile.spark                  # Spark image running as the Airflow user
+└── docker-compose.yaml               # Airflow + Spark cluster + MariaDB + PostgreSQL
 ```
 
 ## Star schema (`analytics` schema in PostgreSQL)
@@ -59,11 +83,15 @@ docker compose up -d --build
 # and trigger flight_price_pipeline
 ```
 
+The Spark master UI is at <http://localhost:9090>. Each Spark task shows up there
+as an application while it runs. From the host, MariaDB is on port 3307 and
+PostgreSQL on 5433, so they don't clash with local installs.
+
 ## Run in WSL (no Docker)
 
 ```bash
 cp .env.example .env
-bash scripts/setup_wsl.sh     # MySQL, Java, venv, Airflow DB, connections
+bash scripts/setup_wsl.sh     # MariaDB, Java, venv, Airflow DB, connections
 bash scripts/run_dag.sh       # runs the whole DAG once
 ```
 

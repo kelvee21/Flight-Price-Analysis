@@ -1,4 +1,5 @@
-# Airflow 3.4 + MySQL (staging) + PostgreSQL (metadata + analytics)
+# Airflow 3.4 (orchestration) + MariaDB (staging) + PostgreSQL (metadata + analytics)
+# + a Spark standalone cluster (compute)
 # Usage: docker compose up -d
 name: flight-price-analysis
 
@@ -22,8 +23,12 @@ x-airflow-common: &airflow-common
     # Login uses Airflow 3's simple auth manager; init writes the password file.
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: '${_AIRFLOW_WWW_USER_USERNAME:-admin}:admin'
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/config/passwords.json
-    AIRFLOW_CONN_MYSQL_STAGING: 'mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mysql:3306/${MYSQL_DATABASE}'
+    AIRFLOW_CONN_MYSQL_STAGING: 'mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mariadb:3306/${MYSQL_DATABASE}'
     AIRFLOW_CONN_POSTGRES_ANALYTICS: 'postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}'
+    # Spark jobs run on the cluster; the task (driver) runs in the scheduler container.
+    SPARK_MASTER: spark://spark-master:7077
+    SPARK_DRIVER_HOST: airflow-scheduler
+    PYSPARK_PYTHON: python3
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
     - ${AIRFLOW_PROJ_DIR:-.}/include:/opt/airflow/include
@@ -34,8 +39,22 @@ x-airflow-common: &airflow-common
   depends_on:
     postgres:
       condition: service_healthy
-    mysql:
+    mariadb:
       condition: service_healthy
+    spark-master:
+      condition: service_started
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: Dockerfile.spark
+    args:
+      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+  image: flight-price-analysis-spark:4.3.0
+  # Executors read and write Parquet here, so the path must match the Airflow containers.
+  volumes:
+    - ${AIRFLOW_PROJ_DIR:-.}/include/data:/opt/airflow/include/data
+  restart: unless-stopped
 
 services:
   postgres:
@@ -47,7 +66,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5433:5432"   # 5433 on the host so it doesn't clash with a local PostgreSQL
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 10s
@@ -55,24 +74,37 @@ services:
       retries: 5
     restart: unless-stopped
 
-  mysql:
-    image: mysql:8.0
+  mariadb:
+    image: mariadb:11.8
     environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: ${MYSQL_DATABASE}
-      MYSQL_USER: ${MYSQL_USER}
-      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MARIADB_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${MYSQL_DATABASE}
+      MARIADB_USER: ${MYSQL_USER}
+      MARIADB_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mariadb_data:/var/lib/mysql
     ports:
-      - "3306:3306"
+      - "3307:3306"   # 3307 on the host so it doesn't clash with a local MySQL
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
       interval: 10s
       timeout: 5s
       retries: 10
     restart: unless-stopped
-    command: --default-authentication-plugin=mysql_native_password
+
+  spark-master:
+    <<: *spark-common
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    ports:
+      - "9090:8080"   # Spark master UI
+
+  spark-worker:
+    <<: *spark-common
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: 2g
+    depends_on: [spark-master]
 
   airflow-init:
     <<: *airflow-common
@@ -125,4 +157,4 @@ services:
 
 volumes:
   postgres_data:
-  mysql_data:
+  mariadb_data:

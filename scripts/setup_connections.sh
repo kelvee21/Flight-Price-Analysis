@@ -7,7 +7,7 @@ airflow connections delete postgres_analytics 2>/dev/null || true
 
 airflow connections add mysql_staging \
   --conn-type mysql \
-  --conn-host "${MYSQL_CONN_HOST:-mysql}" \
+  --conn-host "${MYSQL_CONN_HOST:-mariadb}" \
   --conn-port "${MYSQL_CONN_PORT:-3306}" \
   --conn-login "${MYSQL_USER:-airflow}" \
   --conn-password "${MYSQL_PASSWORD:-airflow}" \

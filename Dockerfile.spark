@@ -1,0 +1,9 @@
+FROM apache/spark:4.3.0-java21-python3
+
+# Run Spark as the same user as Airflow so both can write to the shared data folder.
+ARG AIRFLOW_UID=50000
+USER root
+RUN useradd --uid "${AIRFLOW_UID}" --gid 0 --no-create-home airflow \
+    && mkdir -p /opt/spark/work \
+    && chown "${AIRFLOW_UID}:0" /opt/spark/work
+USER ${AIRFLOW_UID}

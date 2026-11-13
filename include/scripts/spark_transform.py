@@ -35,13 +35,20 @@ FACT_COLUMNS = [
 def create_spark_session(app_name: str = "flight-price-analysis") -> SparkSession:
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
     os.environ.setdefault("PYSPARK_DRIVER_PYTHON", sys.executable)
-    return (
+    builder = (
         SparkSession.builder.appName(app_name)
         .master(os.getenv("SPARK_MASTER", "local[*]"))
         .config("spark.sql.shuffle.partitions", os.getenv("SPARK_SHUFFLE_PARTITIONS", "4"))
         .config("spark.sql.session.timeZone", "UTC")
-        .getOrCreate()
     )
+    # On a cluster the executors must be able to call back to this container.
+    if os.getenv("SPARK_DRIVER_HOST"):
+        builder = (
+            builder.config("spark.driver.host", os.environ["SPARK_DRIVER_HOST"])
+            .config("spark.driver.bindAddress", "0.0.0.0")
+            .config("spark.executor.memory", "1g")
+        )
+    return builder.getOrCreate()
 
 
 def check_columns(df: DataFrame) -> None:

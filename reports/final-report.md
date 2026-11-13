@@ -7,7 +7,7 @@ Project: Airflow data pipeline for the Bangladesh flight price dataset
 ## 1. Summary
 
 For this project I built a pipeline in Apache Airflow that takes the Bangladesh
-flight price CSV from Kaggle (57,000 rows), loads it into a MySQL staging table,
+flight price CSV from Kaggle (57,000 rows), loads it into a MariaDB (MySQL) staging table,
 checks and cleans it with PySpark, and loads a star schema into PostgreSQL.
 The four KPIs from the brief are SQL views in PostgreSQL.
 
@@ -31,13 +31,13 @@ The pipeline has five Airflow tasks that run one after the other:
 CSV file
    |
    v
-ensure_staging_table       create the MySQL staging table
+ensure_staging_table       create the MariaDB staging table
    |
    v
-ingest_csv                 CSV -> MySQL staging (raw copy)
+ingest_csv                 CSV -> MariaDB staging (raw copy)
    |
    v
-validate_data              MySQL staging -> Spark -> quality report (JSON)
+validate_data              MariaDB staging -> Spark -> quality report (JSON)
    |
    v
 transform_to_star_schema   Spark -> Parquet star tables + rejected rows
@@ -46,18 +46,61 @@ transform_to_star_schema   Spark -> Parquet star tables + rejected rows
 load_to_postgres           Parquet -> PostgreSQL "analytics" schema + run log
 ```
 
-Everything runs in Docker Compose:
+Everything runs in Docker Compose. I split the containers by job, the same
+way a cloud setup splits orchestration, storage and compute into separate
+services:
 
-- `postgres` (Postgres 16) stores the Airflow metadata. The star schema is in a
-  separate `analytics` schema in the same database, so my tables don't mix
-  with Airflow's own tables.
-- `mysql` (MySQL 8) holds the staging database `flight_staging`.
-- The Airflow services use a custom image built from the `Dockerfile`. I had
-  to add Java 21 and PySpark to it so Spark could run inside the Airflow
-  container (more on this in the challenges section).
+```text
+                 +-------------------------------+
+                 |  Airflow (orchestration)      |
+                 |  api-server, scheduler,       |
+                 |  dag-processor, triggerer     |
+                 |  Pandas + Spark driver        |
+                 +---+-----------+-----------+---+
+                     |           |           |
+        staging      |           | Spark     |  warehouse
+                     v           v jobs      v
+            +----------+  +--------------+  +---------------------+
+            | mariadb  |  | spark-master |  | postgres            |
+            | staging  |  |      |       |  | Airflow metadata +  |
+            | database |  | spark-worker |  | "analytics" schema  |
+            +----------+  +--------------+  +---------------------+
+                                 |
+                  shared folder: include/data (Parquet files)
+```
 
-The Spark tasks write their output to `include/data/processed/<run_id>/` so
-that different runs don't overwrite each other's files.
+- **Airflow** decides what runs and when. The tasks use Pandas for the
+  small database reads and writes, and start the Spark jobs. The Spark
+  "driver" (the part that plans the job) runs inside the Airflow scheduler
+  container.
+- **spark-master and spark-worker** are a small Spark cluster. The master
+  hands the work to the worker, and the worker's executors do the actual
+  reading, cleaning and writing of the data. To get more compute I would add
+  more workers, without touching Airflow.
+- **mariadb** (MariaDB 11.8, which speaks the MySQL protocol) holds the
+  staging database `flight_staging`.
+- **postgres** (Postgres 16) stores the Airflow metadata. The star schema is
+  in a separate `analytics` schema in the same database, so my tables don't
+  mix with Airflow's own tables.
+- The Airflow and Spark containers share the `include/data` folder. Parquet
+  files written by one side can be read by the other. Each run uses its own
+  folder, `include/data/processed/<run_id>/`, so runs don't overwrite each
+  other's files.
+
+How this maps to cloud services (for example on AWS or GCP):
+
+| In this project | Cloud equivalent |
+| --- | --- |
+| Airflow containers | Managed Airflow (MWAA, Cloud Composer) |
+| spark-master + spark-worker | Managed Spark cluster (EMR, Dataproc) |
+| Shared `include/data` folder | Object storage (S3, GCS) |
+| mariadb | Managed MySQL/MariaDB (RDS, Cloud SQL) |
+| postgres `analytics` schema | Warehouse database (RDS PostgreSQL, Redshift) |
+| `.env` passwords | Secrets manager |
+
+The WSL setup does not have a cluster. There Spark runs in "local" mode
+inside the Airflow process. The same code works in both because the Spark
+master address comes from the `SPARK_MASTER` setting.
 
 ## 3. Why I used each tool
 
@@ -66,7 +109,7 @@ fails, and gives me logs and a UI. I set `schedule=None` because the data is a
 fixed Kaggle file, so it makes more sense to trigger the DAG by hand than on a
 timer. `max_active_runs=1` stops two runs from loading at the same time.
 
-**Pandas** moves data in and out of the databases: CSV into MySQL, MySQL
+**Pandas** moves data in and out of the databases: CSV into MariaDB, MariaDB
 staging out to Parquet for Spark, and the Spark output into PostgreSQL. It
 works with the SQLAlchemy engines that the Airflow MySQL and Postgres hooks
 return, so each load is a `to_sql()` or `read_sql()` call. Setting up Spark
@@ -77,7 +120,8 @@ enough for Pandas alone, but I used Spark because the brief asked for it and
 because the same code would work on a much bigger dataset. I convert the
 fares with `try_cast`, so a bad value becomes NULL instead of crashing the job.
 
-**MySQL** is the staging area. It keeps a copy of the raw data in the same
+**MariaDB** (a MySQL-compatible database) is the staging area. Airflow
+connects to it with the normal MySQL hook. It keeps a copy of the raw data in the same
 shape as the CSV, and the Spark tasks read from it (not from the CSV), so
 staging really is the input to the rest of the pipeline.
 
@@ -112,12 +156,12 @@ Airline, Source, Destination, Base Fare, Tax & Surcharge and Total Fare. It
 renames the columns to snake_case (optional columns that are missing become
 empty columns) and converts the numeric columns. Then, in a
 single transaction, it deletes the old staging rows, inserts the new ones in
-batches of 500, and checks that the number of rows in MySQL matches the CSV.
+batches of 500, and checks that the number of rows in MariaDB matches the CSV.
 If the counts don't match, the transaction is rolled back.
 
 ### validate_data
 
-Reads the staged rows back from MySQL, saves them as Parquet, and uses Spark
+Reads the staged rows back from MariaDB, saves them as Parquet, and uses Spark
 to count data quality problems:
 
 - blank airline, source or destination
@@ -172,7 +216,7 @@ inside transactions, so a failed run never leaves a table half-loaded.
 **Dimensions:**
 
 | Table | Natural key | Surrogate key | Other columns | Rows |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | dim_airline | airline | airline_key | - | 24 |
 | dim_route | source + destination | route_key | source_name, destination_name | 152 |
 | dim_season | seasonality | season_key | is_peak | 4 |
@@ -215,7 +259,7 @@ numbers below come from querying the views after a full DAG run.
 `AVG(total_fare_bdt)` grouped by airline.
 
 | Airline | Avg total fare (BDT) | Rows |
-|---|---:|---:|
+| --- | ---: | ---: |
 | Turkish Airlines | 74,738.63 | 2,220 |
 | AirAsia | 73,830.16 | 2,312 |
 | Cathay Pacific | 72,594.05 | 2,282 |
@@ -232,7 +276,7 @@ numbers below come from querying the views after a full DAG run.
 I counted Eid, Hajj and Winter Holidays as peak seasons.
 
 | Season | Peak | Avg total fare (BDT) | Rows |
-|---|---|---:|---:|
+| --- | --- | ---: | ---: |
 | Hajj | yes | 96,189.95 | 942 |
 | Eid | yes | 90,790.87 | 603 |
 | Winter Holidays | yes | 79,256.33 | 10,930 |
@@ -251,7 +295,7 @@ The other 23 airlines have between 2,201 and 2,368 rows each.
 source and destination so the ranking is the same every time.
 
 | Rank | Route | Rows |
-|---:|---|---:|
+| ---: | --- | ---: |
 | 1 | RJH -> SIN (Rajshahi - Singapore) | 417 |
 | 2 | DAC -> DXB (Dhaka - Dubai) | 413 |
 | 3 | BZL -> YYZ (Barisal - Toronto) | 410 |
@@ -269,13 +313,13 @@ The route counts are very even: the 1st route has only 14 more rows than the
 ## 7. Data quality results
 
 | Check | Result |
-|---|---|
+| --- | --- |
 | Required columns present | Yes |
 | Blank airline / source / destination | 0 |
 | Invalid airport codes | 0 |
 | Non-numeric or negative fares | 0 |
 | Total fare not equal to base + tax | 2,522 (recalculated) |
-| Rows in CSV / MySQL / fact table | 57,000 / 57,000 / 57,000 |
+| Rows in CSV / staging / fact table | 57,000 / 57,000 / 57,000 |
 | Rows rejected | 0 |
 
 The same numbers are saved in `analytics.etl_run_log` for every run, so I can
@@ -337,6 +381,15 @@ and password from `.env`. Then the load failed only in Docker: the image uses
 psycopg 3, which sent the decimal fares as text. I convert the fares to float
 before loading, and PostgreSQL rounds them back to NUMERIC(12,2).
 
+**The Spark cluster couldn't write to the shared folder.** When I moved Spark
+into its own containers, the job failed with "Mkdirs failed". Airflow created
+the run folder as its own user (uid 50000), but the Spark image runs as a
+different user (uid 185) that wasn't allowed to write there. Running the Spark
+image as uid 50000 made Hadoop crash because that user didn't exist inside
+the image. I added a small `Dockerfile.spark` that creates the user and runs
+Spark as it, so both sides write as the same user. In the cloud, this would
+be giving both services permission on the same storage bucket.
+
 **Spark couldn't write Parquet on Windows.** On Windows, Hadoop needs
 `winutils.exe`. Instead of setting that up, I run the pipeline in Docker or
 WSL.
@@ -359,6 +412,7 @@ mkdir -p logs plugins config
 docker compose up -d --build
 # open http://localhost:8080, log in with the user and password from .env,
 # and trigger flight_price_pipeline
+# Spark master UI: http://localhost:9090
 ```
 
 Or in WSL without Docker: `bash scripts/setup_wsl.sh` once, then
@@ -388,6 +442,6 @@ the second run. It needs the databases, so it only runs with
 
 - DAG: `dags/flight_price_pipeline.py`
 - Spark code: `include/scripts/spark_transform.py`
-- MySQL table: `include/sql/create_staging_mysql.sql`
+- MariaDB staging table: `include/sql/create_staging_mysql.sql`
 - PostgreSQL tables and KPI views: `include/sql/create_analytics_postgres.sql`
 - Tests: `tests/`
