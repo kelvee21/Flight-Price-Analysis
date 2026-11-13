@@ -9,11 +9,11 @@ import os
 import pandas as pd
 import pytest
 
+from include.config import CSV_PATH, PG_CONN_ID, PROJECT_ROOT
+
 pytestmark = pytest.mark.skipif(
     os.getenv("RUN_INTEGRATION") != "1", reason="set RUN_INTEGRATION=1 to run against the databases"
 )
-
-from include.config import CSV_PATH, PG_CONN_ID, PROJECT_ROOT
 
 
 def run_dag_and_read_warehouse():

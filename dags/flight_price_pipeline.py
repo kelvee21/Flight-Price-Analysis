@@ -11,13 +11,16 @@ from pathlib import Path
 import pandas as pd
 from airflow.providers.mysql.hooks.mysql import MySqlHook
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.sdk import dag, get_current_context, task
+from airflow.providers.smtp.notifications.smtp import SmtpNotifier
+from airflow.sdk import chain, dag, get_current_context, task
 from sqlalchemy import text
 
 # Airflow only puts dags/ on the path; the project root is needed for `include`.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from include.config import (
+    ALERT_EMAILS,
+    ALERT_FROM_EMAIL,
     ANALYTICS_SCHEMA,
     COLUMN_MAP,
     CSV_PATH,
@@ -26,8 +29,11 @@ from include.config import (
     PG_CONN_ID,
     PROJECT_ROOT,
     REQUIRED_COLUMNS,
+    SMTP_CONN_ID,
     STAGING_COLUMNS,
     STAGING_TABLE,
+    TASK_RETRIES,
+    TASK_RETRY_DELAY_MINUTES,
     WORK_DIR,
 )
 
@@ -42,9 +48,49 @@ def read_sql_statements(path: Path) -> list[str]:
     return [part.strip() for part in path.read_text(encoding="utf-8").split(";") if part.strip()]
 
 
+def current_run_id() -> str:
+    run_id = get_current_context().get("run_id")
+    if run_id is None:
+        raise RuntimeError("No run_id in the task context")
+    return run_id
+
+
 def run_folder(run_id: str) -> Path:
     safe_id = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in run_id)
     return WORK_DIR / safe_id
+
+
+def failure_alert() -> SmtpNotifier | None:
+    """Email sent when a task fails for good (Airflow only calls it after the last retry)."""
+    if not ALERT_EMAILS:
+        return None
+    return SmtpNotifier(
+        smtp_conn_id=SMTP_CONN_ID,
+        from_email=ALERT_FROM_EMAIL or None,
+        to=ALERT_EMAILS,
+        subject="[Airflow] {{ dag.dag_id }}.{{ ti.task_id }} failed",
+        html_content=(
+            "<p>Task <b>{{ ti.task_id }}</b> in DAG <b>{{ dag.dag_id }}</b> failed "
+            "after {{ ti.try_number }} attempt(s).</p>"
+            "<ul>"
+            "<li>Run: {{ run_id }}</li>"
+            "<li>Error: {{ exception }}</li>"
+            "<li>Logs: <a href=\"{{ ti.log_url }}\">{{ ti.log_url }}</a></li>"
+            "</ul>"
+        ),
+    )
+
+
+DEFAULT_ARGS = {
+    "owner": "airflow",
+    "retries": TASK_RETRIES,
+    "retry_delay": timedelta(minutes=TASK_RETRY_DELAY_MINUTES),
+    # Waits 2, 4, ... minutes between tries, capped so a broken run does not hang around.
+    "retry_exponential_backoff": True,
+    "max_retry_delay": timedelta(minutes=10),
+}
+if (alert := failure_alert()) is not None:
+    DEFAULT_ARGS["on_failure_callback"] = alert
 
 
 @dag(
@@ -55,7 +101,7 @@ def run_folder(run_id: str) -> Path:
     catchup=False,
     max_active_runs=1,
     tags=["flight", "etl", "spark", "star-schema"],
-    default_args={"owner": "airflow", "retries": 1, "retry_delay": timedelta(minutes=1)},
+    default_args=DEFAULT_ARGS,
 )
 def flight_price_pipeline():
     @task
@@ -101,7 +147,7 @@ def flight_price_pipeline():
                 raise RuntimeError(f"Staged {staged} rows but the CSV has {len(staging)}")
 
         log.info("Staged %s rows into %s", staged, STAGING_TABLE)
-        return str(run_folder(get_current_context()["run_id"]))
+        return str(run_folder(current_run_id()))
 
     @task
     def validate_data(work_dir: str) -> str:
@@ -199,7 +245,7 @@ def flight_price_pipeline():
                     "VALUES (:run_id, :input_rows, :loaded_rows, :rejected_rows, :recomputed)"
                 ),
                 {
-                    "run_id": get_current_context()["run_id"],
+                    "run_id": current_run_id(),
                     "input_rows": report["input_rows"],
                     "loaded_rows": loaded,
                     "rejected_rows": report["rejected_rows"],
@@ -209,8 +255,10 @@ def flight_price_pipeline():
         log.info("Loaded %s fact rows into %s", loaded, ANALYTICS_SCHEMA)
 
     work_dir = ingest_csv()
-    ensure_staging_table() >> work_dir
-    load_to_postgres(transform_to_star_schema(validate_data(work_dir)))
+    chain(ensure_staging_table(), work_dir)
+    # At parse time each task returns an XComArg that Airflow resolves to a str at run time,
+    # but Airflow's type hints don't model that, so Pylance flags it.
+    load_to_postgres(transform_to_star_schema(validate_data(work_dir)))  # pyright: ignore[reportArgumentType]
 
 
 flight_price_pipeline()

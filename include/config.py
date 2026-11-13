@@ -55,3 +55,13 @@ PEAK_SEASONS = {"Eid", "Hajj", "Winter Holidays"}
 
 # The run fails if more than this share of rows is rejected.
 MAX_REJECTED_RATIO = float(os.getenv("MAX_REJECTED_RATIO", "0.05"))
+
+# Failure alerts: a task that fails after all its retries sends an email through Gmail.
+SMTP_CONN_ID = os.getenv("SMTP_CONN_ID", "smtp_gmail")
+ALERT_FROM_EMAIL = os.getenv("GMAIL_USER", "")
+# Comma-separated list. Empty means no alert emails are sent.
+ALERT_EMAILS = [email.strip() for email in os.getenv("ALERT_EMAIL", "").split(",") if email.strip()]
+
+# Retry settings shared by every task.
+TASK_RETRIES = int(os.getenv("TASK_RETRIES", "2"))
+TASK_RETRY_DELAY_MINUTES = int(os.getenv("TASK_RETRY_DELAY_MINUTES", "2"))

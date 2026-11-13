@@ -25,6 +25,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/config/passwords.json
     AIRFLOW_CONN_MYSQL_STAGING: 'mysql://${MYSQL_USER}:${MYSQL_PASSWORD}@mariadb:3306/${MYSQL_DATABASE}'
     AIRFLOW_CONN_POSTGRES_ANALYTICS: 'postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}'
+    # Gmail SMTP over SSL for failure alerts. The password is a Gmail app password, not the account one.
+    # Port 465 is SSL from the start, so STARTTLS (on by default in the hook) has to be off.
+    AIRFLOW_CONN_SMTP_GMAIL: '{"conn_type": "smtp", "host": "smtp.gmail.com", "port": 465, "login": "${GMAIL_USER:-}", "password": "${GMAIL_APP_PASSWORD:-}", "extra": {"disable_tls": true}}'
     # Spark jobs run on the cluster; the task (driver) runs in the scheduler container.
     SPARK_MASTER: spark://spark-master:7077
     SPARK_DRIVER_HOST: airflow-scheduler
